@@ -1,12 +1,4 @@
-__future__
-csv
-io
-math
-re
-dataclasses
-pathlib
-typing
+streamlit
 numpy
 pandas
-plotly.graph_objects
-PIP==26.1.2
+plotly
