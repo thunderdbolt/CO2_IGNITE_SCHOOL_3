@@ -9,3 +9,4 @@ typing
 numpy
 pandas
 plotly.graph_objects
+PIP 26.1.2
