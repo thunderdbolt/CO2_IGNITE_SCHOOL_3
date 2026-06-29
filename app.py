@@ -11,13 +11,17 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import tempfile
+import os
+from Trend import trend
+
 import streamlit as st
 
 
 CHANNEL_RE = re.compile(r"(?i)(?<![A-Z0-9])(PT|TT)\s*[-_ ]?\s*(\d{2,5})(?!\d)")
-TIME_RE = re.compile(r"(?i)\btime\b|^\s*t\s*(?:\[?s\]?|pt|$)")
+TIME_RE = re.compile(r"(?i)\btime\b|^\s*t\s*(?:\[?s\]?|pt|tt|$)")
 EXCEL_SUFFIXES = {".xlsx", ".xlsm", ".xls"}
-TEXT_SUFFIXES = {".csv", ".txt", ".tsv", ".dat"}
+TEXT_SUFFIXES = {".csv", ".txt", ".tsv", ".dat", ".tpl"}
 
 
 @dataclass
@@ -157,7 +161,96 @@ def read_excel_raw(data: bytes, filename: str, sheet_name: str) -> pd.DataFrame:
     )
 
 
+def parse_trend_file(data: bytes, filename: str) -> tuple[pd.DataFrame, str]:
+    """
+    Parses an OLGA .tpl trend file using the Trend.py class. It constructs
+    a full ParsedDataset directly, using the rich metadata from the file,
+    bypassing the generic parse_raw_table function.
+    """
+    # The Trend class requires a file path, so we create a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        trend_obj = trend(tmp_path)
+
+        meta_df = trend_obj.get_variables
+        # The raw numerical data starts from row 7. Convert all to numeric.
+        data_df = trend_obj.to_dataframe.iloc[7:].apply(pd.to_numeric, errors="coerce")
+        # Assign temporary column names for processing
+        data_df.columns = range(data_df.shape[1])
+
+        series: dict[str, pd.DataFrame] = {}
+        units: dict[str, str] = {}
+        warnings: list[str] = []
+
+        # The first column (index 0) is always time
+        time_series = data_df.iloc[:, 0]
+
+        # Iterate through metadata to build channels
+        for col_idx, (_, meta_row) in enumerate(meta_df.iterrows()):
+            if col_idx == 0:  # Skip time column metadata
+                continue
+
+            base_name = meta_row["Variable_Name"]
+            channel = None
+
+            # Construct canonical channel name like 'PT201'
+            if base_name in ("PT", "TT", "TM"):
+                # Normalize TM from OLGA to TT for comparison with measured data
+                prefix = "TT" if base_name == "TM" else base_name
+                search_str = f'{meta_row["Variable_Branch"]} {meta_row["Variable_Pipe_Name"]}'
+                match = re.search(r"(\d{2,})", search_str)
+                if match:
+                    channel_name = f"{prefix}{match.group(1)}"
+                else:
+                    # Fallback if no number is found, might create duplicates
+                    channel_name = prefix
+                channel = channel_name
+            elif base_name != "Time":  # For other variables like VOLGBL, just use the name
+                channel = base_name
+
+            if not channel:
+                warnings.append(f"Could not form a channel name for column {col_idx} ('{base_name}').")
+                continue
+
+            value_series = data_df.iloc[:, col_idx]
+            frame = pd.DataFrame({"time_s": time_series, "value": value_series}).dropna()
+
+            if frame.empty:
+                warnings.append(f"{channel}: no numeric time/value pairs were found.")
+                continue
+
+            if len(frame) < 2:
+                warnings.append(f"{channel}: only one valid sample was found.")
+                continue
+
+            if channel in series:
+                warnings.append(f"{channel}: duplicate channel header found; the last occurrence was used.")
+
+            series[channel] = frame
+            # Use the unit directly from the parsed metadata, and standardize to lowercase
+            units[channel] = str(meta_row["Variable_Unit"]).lower()
+
+        if not series:
+            raise ValueError("No valid channels with at least two data points could be parsed from the .tpl file.")
+
+        # The dataset name will be set in get_parsed_dataset
+        return ParsedDataset(
+            name="", series=series, units=units, warnings=warnings, header_row=-1, sheet_name=None
+        ), "Trend (.tpl)"
+    finally:
+        # Ensure the temporary file is deleted
+        os.unlink(tmp_path)
+
+
 def find_header_row(raw: pd.DataFrame) -> int:
+    # For .tpl files, the header is now the first row (index 0) of the parsed frame.
+    # For other files, we search for it.
+    if "Time" in raw.columns and any(CHANNEL_RE.search(str(c)) for c in raw.columns):
+        return -1 # Indicates headers are already set in the columns
+
+    # Fallback for non-tpl files
     best_row = -1
     best_score = 0
     for row_index in range(min(len(raw), 200)):
@@ -203,7 +296,14 @@ def parse_raw_table(
 
     raw = raw.dropna(axis=1, how="all").dropna(axis=0, how="all").reset_index(drop=True)
     header_row = find_header_row(raw)
-    headers = raw.iloc[header_row].tolist()
+
+    if header_row == -1: # Headers are in columns
+        headers = raw.columns.tolist()
+        data_start_row = 0
+    else: # Headers are in a row
+        headers = raw.iloc[header_row].tolist()
+        data_start_row = header_row + 1
+
     series: dict[str, pd.DataFrame] = {}
     units: dict[str, str] = {}
     warnings: list[str] = []
@@ -218,8 +318,8 @@ def parse_raw_table(
             warnings.append(f"{channel}: no associated time column was found.")
             continue
 
-        time = numeric_series(raw.iloc[header_row + 1 :, time_col])
-        value = numeric_series(raw.iloc[header_row + 1 :, value_col])
+        time = numeric_series(raw.iloc[data_start_row:, time_col])
+        value = numeric_series(raw.iloc[data_start_row:, value_col])
         frame = pd.DataFrame({"time_s": time, "value": value}).dropna()
         if frame.empty:
             warnings.append(f"{channel}: no numeric time/value pairs were found.")
@@ -264,6 +364,12 @@ def get_parsed_dataset(
             sheet_name = excel_sheet_names(file_data, filename)[0]
         raw = read_excel_raw(file_data, filename, sheet_name)
         return parse_raw_table(raw, dataset_name, sheet_name), f"Excel sheet: {sheet_name}"
+    if suffix == ".tpl":
+        # parse_trend_file now returns the full ParsedDataset
+        parsed_data, note = parse_trend_file(file_data, filename)
+        parsed_data.name = dataset_name  # Assign the correct name
+        return parsed_data, note
+
     if suffix in TEXT_SUFFIXES or not suffix:
         try:
             raw, delimiter = read_text_raw(file_data)
@@ -362,11 +468,19 @@ def align_and_transform_datasets(
         real = transform_series(
             real_data.series[channel], normalize_start, real_time_shift, real_scale, real_offset
         )
+
+        # Apply channel-specific auto-scaling for Pa vs bar, on top of the global manual scale
+        channel_sim_scale = simulated_scale
+        real_unit = real_data.units.get(channel, "").lower()
+        sim_unit = simulated_data.units.get(channel, "").lower()
+        if sim_unit == "pa" and real_unit in ("bar", "bara", "barg"):
+            channel_sim_scale *= 1e-5
+
         simulated = transform_series(
             simulated_data.series[channel],
             normalize_start,
             simulated_time_shift,
-            simulated_scale,
+            channel_sim_scale,
             simulated_offset,
         )
         grid, real_values, simulated_values = comparison_grid(
@@ -561,13 +675,56 @@ def main() -> None:
     with upload_left:
         st.subheader("Real / measured data")
         real_upload = st.file_uploader(
-            "Upload measured file", type=["csv", "tsv", "txt", "dat", "xlsx", "xlsm", "xls"], key="real"
+            "Upload measured file", type=["csv", "tsv", "txt", "dat", "xlsx", "xlsm", "xls", "tpl"], key="real"
         )
     with upload_right:
         st.subheader("Simulated data")
         simulated_upload = st.file_uploader(
-            "Upload simulation file", type=["csv", "tsv", "txt", "dat", "xlsx", "xlsm", "xls"], key="simulated"
+            "Upload simulation file", type=["csv", "tsv", "txt", "dat", "xlsx", "xlsm", "xls", "tpl"], key="simulated"
         )
+
+    # --- SIDEBAR (GLOBAL CONTROLS) ---
+    # The sidebar must be defined outside the tabs to prevent re-rendering issues.
+    # We use session_state to check if we can show the controls yet.
+    if st.session_state.get("channels_submitted"):
+        with st.sidebar:
+            st.header("Alignment")
+            normalize_start = st.toggle(
+                "Set each channel's first time to 0", value=False,
+                help="Applied before the manual time shifts below.",
+            )
+            real_time_shift = st.number_input("Measured time shift [s]", value=0.0, format="%.9f", key="real_time_shift")
+            simulated_time_shift = st.number_input("Simulation time shift [s]", value=0.0, format="%.9f", key="simulated_time_shift")
+            grid_mode = st.selectbox(
+                "Comparison grid", ["Real timestamps", "Simulated timestamps", "Uniform overlap grid"], key="grid_mode"
+            )
+            uniform_points = st.number_input(
+                "Uniform grid points", min_value=100, max_value=500_000, value=5000, step=100,
+                disabled=grid_mode != "Uniform overlap grid", key="uniform_points"
+            )
+
+            st.header("Value transform")
+            st.caption("Transformed value = original × scale + offset")
+            real_scale = st.number_input("Measured scale", value=1.0, format="%.9f", key="real_scale")
+            real_offset = st.number_input("Measured offset", value=0.0, format="%.9f", key="real_offset")
+            simulated_scale = st.number_input("Simulation scale", value=1.0, format="%.9f", key="simulated_scale")
+            simulated_offset = st.number_input("Simulation offset", value=0.0, format="%.9f", key="simulated_offset")
+            # The transformed_range call needs to happen here to get default window values
+            if st.session_state.get("real_data") and st.session_state.get("simulated_data"):
+                real_range = transformed_range(st.session_state.real_data, st.session_state.selected_channels, normalize_start, real_time_shift)
+                sim_range = transformed_range(
+                    st.session_state.simulated_data, st.session_state.selected_channels, normalize_start, simulated_time_shift
+                )
+                default_start = max(real_range[0], sim_range[0])
+                default_end = min(real_range[1], sim_range[1])
+                st.header("Time window")
+                use_window = st.toggle("Limit comparison window", value=False, key="use_window")
+                window_start = st.number_input(
+                    "Window start [s]", value=float(default_start), format="%.9f", disabled=not use_window, key="window_start"
+                )
+                window_end = st.number_input(
+                    "Window end [s]", value=float(default_end), format="%.9f", disabled=not use_window, key="window_end"
+                )
 
     main_tabs = st.tabs(["Data Comparison", "CFL Calculator"])
 
@@ -580,269 +737,248 @@ def main() -> None:
                     "- Excel headers such as `Time [s]`, `PT [bara] (PT201)` or `TM [C] (TT251)`, repeated for each channel.\n"
                     "- The header may occur within the first 200 rows; nonnumeric metadata rows are ignored."
                 )
-            return
+        else:
+            try:
+                real_bytes = real_upload.getvalue()
+                simulated_bytes = simulated_upload.getvalue()
+            except Exception as e:
+                st.error(f"Error reading files from path: {e}")
+                return
 
-        real_bytes = real_upload.getvalue()
-        simulated_bytes = simulated_upload.getvalue()
+            real_sheet = None
+            simulated_sheet = None
+            simulated_filepath = Path(simulated_upload.name)
+            try:
+                if Path(real_upload.name).suffix.lower() in EXCEL_SUFFIXES:
+                    real_sheets = excel_sheet_names(real_bytes, real_upload.name)
+                    real_sheet = st.selectbox("Measured Excel sheet", real_sheets, key="real_sheet")
+                if simulated_filepath.suffix.lower() in EXCEL_SUFFIXES:
+                    simulated_sheets = excel_sheet_names(simulated_bytes, simulated_filepath.name)
+                    simulated_sheet = st.selectbox("Simulation Excel sheet", simulated_sheets, key="sim_sheet")
+            except Exception as exc:
+                st.error(f"The Excel workbook could not be opened: {exc}")
+                return
 
-        real_sheet = None
-        simulated_sheet = None
-        try:
-            if Path(real_upload.name).suffix.lower() in EXCEL_SUFFIXES:
-                real_sheets = excel_sheet_names(real_bytes, real_upload.name)
-                real_sheet = st.selectbox("Measured Excel sheet", real_sheets, key="real_sheet")
-            if Path(simulated_upload.name).suffix.lower() in EXCEL_SUFFIXES:
-                simulated_sheets = excel_sheet_names(simulated_bytes, simulated_upload.name)
-                simulated_sheet = st.selectbox("Simulation Excel sheet", simulated_sheets, key="sim_sheet")
-        except Exception as exc:
-            st.error(f"The Excel workbook could not be opened: {exc}")
-            return
+            try:
+                # Use file path as part of the cache key to handle different files
+                real_data, real_note = get_parsed_dataset(
+                    real_upload.file_id, real_bytes, real_upload.name, "Real", real_sheet)
+                simulated_data, simulated_note = get_parsed_dataset(
+                    str(simulated_filepath), simulated_bytes, simulated_filepath.name, "Simulated", simulated_sheet)
+                # Store data in session state for the sidebar to access
+                st.session_state.real_data = real_data
+                st.session_state.simulated_data = simulated_data
+            except (ValueError, IndexError, KeyError) as exc:
+                st.error(f"Parsing failed: {exc}")
+                st.exception(exc)
+                return
 
-        try:
-            real_data, real_note = get_parsed_dataset(
-                real_upload.file_id, real_bytes, real_upload.name, "Real", real_sheet)
-            simulated_data, simulated_note = get_parsed_dataset(
-                simulated_upload.file_id, simulated_bytes, simulated_upload.name, "Simulated", simulated_sheet)
-        except (ValueError, IndexError, KeyError) as exc:
-            st.error(f"Parsing failed: {exc}")
-            st.exception(exc)
-            return
+            with st.expander("Detected datasets", expanded=False):
+                left, right = st.columns(2)
+                with left:
+                    st.markdown("#### Measured")
+                    render_dataset_summary(real_data, real_note)
+                with right:
+                    st.markdown("#### Simulated")
+                    render_dataset_summary(simulated_data, simulated_note)
 
-        with st.expander("Detected datasets", expanded=False):
-            left, right = st.columns(2)
-            with left:
-                st.markdown("#### Measured")
-                render_dataset_summary(real_data, real_note)
-            with right:
-                st.markdown("#### Simulated")
-                render_dataset_summary(simulated_data, simulated_note)
-
-        common_channels = sorted(
-            set(real_data.channels).intersection(simulated_data.channels), key=natural_channel_key
-        )
-        only_real = sorted(set(real_data.channels) - set(simulated_data.channels), key=natural_channel_key)
-        only_simulated = sorted(
-            set(simulated_data.channels) - set(real_data.channels), key=natural_channel_key
-        )
-        if not common_channels:
-            st.error("No matching PT or TT channel identifiers were found between the two files.")
-            st.write("Measured channels:", real_data.channels)
-            st.write("Simulated channels:", simulated_data.channels)
-            return
-
-        if only_real or only_simulated:
-            with st.expander("Unmatched channels"):
-                if only_real:
-                    st.write("Measured only:", only_real)
-                if only_simulated:
-                    st.write("Simulated only:", only_simulated)
-
-        # Initialize session state for channel selection
-        if "channels_submitted" not in st.session_state:
-            st.session_state.channels_submitted = False
-            st.session_state.selected_channels = []
-
-        with st.form("channel_selection_form"):
-            st.markdown("#### Channels to compare")
-            select_all = st.checkbox("Select All")
-
-            if select_all:
-                default_selection = common_channels
-            elif st.session_state.selected_channels:
-                default_selection = st.session_state.selected_channels
-            else:
-                default_selection = common_channels[:min(6, len(common_channels))]
-
-            multiselect_selection = st.multiselect(
-                "Channels", common_channels, default=default_selection, label_visibility="collapsed"
+            common_channels = sorted(
+                set(real_data.channels).intersection(simulated_data.channels), key=natural_channel_key
             )
-            
-            submitted = st.form_submit_button("Apply selection")
-            if submitted:
-                st.session_state.selected_channels = multiselect_selection
-                st.session_state.channels_submitted = True
+            only_real = sorted(set(real_data.channels) - set(simulated_data.channels), key=natural_channel_key)
+            only_simulated = sorted(
+                set(simulated_data.channels) - set(real_data.channels), key=natural_channel_key
+            )
+            if not common_channels:
+                st.error("No matching PT or TT channel identifiers were found between the two files.")
+                st.write("Measured channels:", real_data.channels)
+                st.write("Simulated channels:", simulated_data.channels)
+                return
 
-        if not st.session_state.channels_submitted or not st.session_state.selected_channels:
-            st.info("Select one or more channels from the form above and click 'Apply selection' to continue.")
-            return
+            if only_real or only_simulated:
+                with st.expander("Unmatched channels"):
+                    if only_real:
+                        st.write("Measured only:", only_real)
+                    if only_simulated:
+                        st.write("Simulated only:", only_simulated)
 
-        unit_mismatches = [
-            (
-                channel,
-                real_data.units.get(channel, ""),
-                simulated_data.units.get(channel, ""),
-            )
-            for channel in st.session_state.selected_channels
-            if real_data.units.get(channel, "")
-            and simulated_data.units.get(channel, "")
-            and real_data.units.get(channel, "").lower()
-            != simulated_data.units.get(channel, "").lower()
-        ]
-        if unit_mismatches:
-            mismatch_text = ", ".join(
-                f"{channel}: {real_unit} vs {simulated_unit}"
-                for channel, real_unit, simulated_unit in unit_mismatches
-            )
-            st.warning(
-                "Different unit labels were detected (" + mismatch_text + "). "
-                "No automatic unit conversion is applied; use the scale/offset controls when needed."
-            )
+            # Initialize session state for channel selection
+            if "channels_submitted" not in st.session_state:
+                st.session_state.channels_submitted = False
+                st.session_state.selected_channels = []
 
-        with st.sidebar:
-            st.header("Alignment")
-            normalize_start = st.toggle(
-                "Set each channel's first time to 0", value=False,
-                help="Applied before the manual time shifts below.",
-            )
-            real_time_shift = st.number_input("Measured time shift [s]", value=0.0, format="%.9f")
-            simulated_time_shift = st.number_input("Simulation time shift [s]", value=0.0, format="%.9f")
-            grid_mode = st.selectbox(
-                "Comparison grid", ["Real timestamps", "Simulated timestamps", "Uniform overlap grid"]
-            )
-            uniform_points = st.number_input(
-                "Uniform grid points", min_value=100, max_value=500_000, value=5000, step=100,
-                disabled=grid_mode != "Uniform overlap grid",
+            with st.form("channel_selection_form"):
+                st.markdown("#### Channels to compare")
+                select_all = st.checkbox("Select All")
+
+                if select_all:
+                    default_selection = common_channels
+                elif st.session_state.selected_channels:
+                    default_selection = st.session_state.selected_channels
+                else:
+                    default_selection = common_channels[:min(6, len(common_channels))]
+
+                multiselect_selection = st.multiselect(
+                    "Channels", common_channels, default=default_selection, label_visibility="collapsed"
+                )
+                
+                submitted = st.form_submit_button("Apply selection")
+                if submitted:
+                    st.session_state.selected_channels = multiselect_selection
+                    st.session_state.channels_submitted = True
+
+            if not st.session_state.channels_submitted or not st.session_state.selected_channels:
+                st.info("Select one or more channels from the form above and click 'Apply selection' to continue.")
+                return
+
+            # Check for unit mismatches and see if an automatic conversion has been applied by the sidebar logic.
+            unit_mismatches = [
+                (
+                    channel,
+                    real_data.units.get(channel, ""),
+                    simulated_data.units.get(channel, ""),
+                )
+                for channel in st.session_state.selected_channels
+                if real_data.units.get(channel, "") and simulated_data.units.get(channel, "")
+                and real_data.units.get(channel, "").lower() != simulated_data.units.get(channel, "").lower()
+            ]
+
+            pa_to_bar_mismatch_exists = any(
+                sim_unit == "pa" and real_unit in ("bar", "bara", "barg")
+                for _, real_unit, sim_unit in unit_mismatches
             )
 
-            st.header("Value transform")
-            st.caption("Transformed value = original × scale + offset")
-            real_scale = st.number_input("Measured scale", value=1.0, format="%.9f")
-            real_offset = st.number_input("Measured offset", value=0.0, format="%.9f")
-            simulated_scale = st.number_input("Simulation scale", value=1.0, format="%.9f")
-            simulated_offset = st.number_input("Simulation offset", value=0.0, format="%.9f")
+            if unit_mismatches:
+                mismatch_text = ", ".join(f"{ch}: {ru} vs {su}" for ch, ru, su in unit_mismatches)
+                if pa_to_bar_mismatch_exists:
+                    st.info(
+                        f"Unit mismatch detected ({mismatch_text}). An automatic scale factor (1e-5) was applied to relevant pressure channels to convert simulation data from Pa to bar. This is in addition to any manual scaling set in the sidebar."
+                    )
+                else:
+                    st.warning(f"Different unit labels were detected ({mismatch_text}). No automatic conversion was applied. Use the scale/offset controls in the sidebar if needed.")
 
-            real_range = transformed_range(real_data, st.session_state.selected_channels, normalize_start, real_time_shift)
-            sim_range = transformed_range(
-                simulated_data, st.session_state.selected_channels, normalize_start, simulated_time_shift
-            )
-            default_start = max(real_range[0], sim_range[0])
-            default_end = min(real_range[1], sim_range[1])
-            st.header("Time window")
-            use_window = st.toggle("Limit comparison window", value=False)
-            window_start = st.number_input(
-                "Window start [s]", value=float(default_start), format="%.9f", disabled=not use_window
-            )
-            window_end = st.number_input(
-                "Window end [s]", value=float(default_end), format="%.9f", disabled=not use_window
-            )
+            # Retrieve values from sidebar widgets (which are now in session_state)
+            use_window = st.session_state.get("use_window", False)
+            window_start = st.session_state.get("window_start", 0.0)
+            window_end = st.session_state.get("window_end", 0.0)
 
-        if use_window and window_end <= window_start:
-            st.error("Window end must be greater than window start.")
-            return
+            if use_window and window_end <= window_start:
+                st.error("Window end must be greater than window start.")
+                return
 
-        aligned_unwindowed, skipped_channels = align_and_transform_datasets(
-            _real_data_name=real_data.name, real_data=real_data,
-            simulated_data=simulated_data,
-            channels=st.session_state.selected_channels,
-            grid_mode=grid_mode,
-            uniform_points=int(uniform_points),
-            normalize_start=normalize_start,
-            real_time_shift=real_time_shift,
-            simulated_time_shift=simulated_time_shift,
-            real_scale=real_scale,
-            real_offset=real_offset,
-            simulated_scale=simulated_scale,
-            simulated_offset=simulated_offset,
-        )
-
-        aligned_final = process_aligned_data(
-            aligned_unwindowed,
-            window_start=float(window_start) if use_window else None,
-            window_end=float(window_end) if use_window else None,
-        )
-
-        if aligned_final.empty:
-            st.error("No comparable samples remain after alignment. Check the time shifts and time window.")
-            for message in skipped_channels:
-                st.warning(message)
-            return
-
-        summary = overall_metrics(aligned_final)
-        metric_columns = st.columns(4)
-        for column, (label, value) in zip(metric_columns, summary.items()):
-            column.metric(label, f"{value:.6g}")
-
-        metrics = compute_all_metrics(aligned_final)
-
-        signal_tab, difference_tab, grid_tab, metrics_tab, data_tab = st.tabs(
-            ["Signals", "Difference", "Grid View", "Metrics", "Aligned data"]
-        )
-        with signal_tab:
-            st.plotly_chart(signal_figure(aligned_final, st.session_state.selected_channels), use_container_width=True)
-        with difference_tab:
-            st.plotly_chart(difference_figure(aligned_final, st.session_state.selected_channels), use_container_width=True)
-        with grid_tab:
-            grid_cols = st.columns(3)
-            for i, channel in enumerate(st.session_state.selected_channels):
-                col = grid_cols[i % 3]
-                with col:
-                    st.markdown(f"**{channel}**")
-                    channel_data = aligned_final[aligned_final["channel"] == channel]
-                    if not channel_data.empty:
-                        fig = go.Figure()
-                        fig.add_trace(
-                            go.Scatter(
-                                x=channel_data["time_s"], y=channel_data["real"], mode="lines",
-                                name="Real", line={"color": "#636EFA", "width": 2},
-                            )
-                        )
-                        fig.add_trace(
-                            go.Scatter(
-                                x=channel_data["time_s"], y=channel_data["simulated"], mode="lines",
-                                name="Simulated",
-                                line={"color": "#EF553B", "width": 1.6, "dash": "dash"},
-                            )
-                        )
-                        fig.update_layout(
-                            xaxis_title="Time [s]",
-                            yaxis_title="Value",
-                            margin={"l": 20, "r": 20, "t": 40, "b": 20},
-                            height=300,
-                            showlegend=True,
-                            legend=dict(
-                                orientation="h",
-                                yanchor="bottom",
-                                y=1.02,
-                                xanchor="right",
-                                x=1
-                            )
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.caption("No data in selected window.")
-        with metrics_tab:
-            st.dataframe(
-                metrics.style.format(
-                    {
-                        "MAE": "{:.6g}",
-                        "RMSE": "{:.6g}",
-                        "bias (real - simulated)": "{:.6g}",
-                        "max abs error": "{:.6g}",
-                        "correlation": "{:.6g}",
-                    }
-                ),
-                width="stretch",
-                hide_index=True,
-            )
-            st.download_button(
-                "Download metrics CSV",
-                data=metrics.to_csv(index=False).encode("utf-8"),
-                file_name="pressure_comparison_metrics.csv",
-                mime="text/csv",
-            )
-        with data_tab:
-            st.dataframe(aligned_final, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download aligned comparison CSV",
-                data=aligned_final.to_csv(index=False).encode("utf-8"),
-                file_name="pressure_comparison_aligned.csv",
-                mime="text/csv",
+            aligned_unwindowed, skipped_channels = align_and_transform_datasets(
+                _real_data_name=real_data.name, real_data=real_data,
+                simulated_data=simulated_data,
+                channels=st.session_state.selected_channels,
+                grid_mode=st.session_state.get("grid_mode", "Real timestamps"),
+                uniform_points=int(st.session_state.get("uniform_points", 5000)),
+                normalize_start=st.session_state.get("normalize_start", False),
+                real_time_shift=st.session_state.get("real_time_shift", 0.0),
+                simulated_time_shift=st.session_state.get("simulated_time_shift", 0.0),
+                real_scale=st.session_state.get("real_scale", 1.0),
+                real_offset=st.session_state.get("real_offset", 0.0),
+                simulated_scale=st.session_state.get("simulated_scale", 1.0),
+                simulated_offset=st.session_state.get("simulated_offset", 0.0),
             )
 
-        if skipped_channels:
-            with st.expander("Skipped channels / ranges"):
+            aligned_final = process_aligned_data(
+                aligned_unwindowed,
+                window_start=float(window_start) if use_window else None,
+                window_end=float(window_end) if use_window else None,
+            )
+
+            if aligned_final.empty:
+                st.error("No comparable samples remain after alignment. Check the time shifts and time window.")
                 for message in skipped_channels:
                     st.warning(message)
+                return
+
+            summary = overall_metrics(aligned_final)
+            metric_columns = st.columns(4)
+            for column, (label, value) in zip(metric_columns, summary.items()):
+                column.metric(label, f"{value:.6g}")
+
+            metrics = compute_all_metrics(aligned_final)
+
+            signal_tab, difference_tab, grid_tab, metrics_tab, data_tab = st.tabs(
+                ["Signals", "Difference", "Grid View", "Metrics", "Aligned data"]
+            )
+            with signal_tab:
+                st.plotly_chart(signal_figure(aligned_final, st.session_state.selected_channels), use_container_width=True)
+            with difference_tab:
+                st.plotly_chart(difference_figure(aligned_final, st.session_state.selected_channels), use_container_width=True)
+            with grid_tab:
+                grid_cols = st.columns(3)
+                for i, channel in enumerate(st.session_state.selected_channels):
+                    col = grid_cols[i % 3]
+                    with col:
+                        st.markdown(f"**{channel}**")
+                        channel_data = aligned_final[aligned_final["channel"] == channel]
+                        if not channel_data.empty:
+                            fig = go.Figure()
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=channel_data["time_s"], y=channel_data["real"], mode="lines",
+                                    name="Real", line={"color": "#636EFA", "width": 2},
+                                )
+                            )
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=channel_data["time_s"], y=channel_data["simulated"], mode="lines",
+                                    name="Simulated",
+                                    line={"color": "#EF553B", "width": 1.6, "dash": "dash"},
+                                )
+                            )
+                            fig.update_layout(
+                                xaxis_title="Time [s]",
+                                yaxis_title="Value",
+                                margin={"l": 20, "r": 20, "t": 40, "b": 20},
+                                height=300,
+                                showlegend=True,
+                                legend=dict(
+                                    orientation="h",
+                                    yanchor="bottom",
+                                    y=1.02,
+                                    xanchor="right",
+                                    x=1
+                                )
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.caption("No data in selected window.")
+            with metrics_tab:
+                st.dataframe(
+                    metrics.style.format(
+                        {
+                            "MAE": "{:.6g}",
+                            "RMSE": "{:.6g}",
+                            "bias (real - simulated)": "{:.6g}",
+                            "max abs error": "{:.6g}",
+                            "correlation": "{:.6g}",
+                        }
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.download_button(
+                    "Download metrics CSV",
+                    data=metrics.to_csv(index=False).encode("utf-8"),
+                    file_name="pressure_comparison_metrics.csv",
+                    mime="text/csv",
+                )
+            with data_tab:
+                st.dataframe(aligned_final, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download aligned comparison CSV",
+                    data=aligned_final.to_csv(index=False).encode("utf-8"),
+                    file_name="pressure_comparison_aligned.csv",
+                    mime="text/csv",
+                )
+
+            if skipped_channels:
+                with st.expander("Skipped channels / ranges"):
+                    for message in skipped_channels:
+                        st.warning(message)
 
     with main_tabs[1]:
         render_cfl_calculator()
