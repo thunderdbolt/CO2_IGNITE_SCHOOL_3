@@ -17,7 +17,7 @@ import streamlit as st
 CHANNEL_RE = re.compile(r"(?i)(?<![A-Z0-9])(PT|TT)\s*[-_ ]?\s*(\d{2,5})(?!\d)")
 TIME_RE = re.compile(r"(?i)\btime\b|^\s*t\s*(?:\[?s\]?|pt|$)")
 EXCEL_SUFFIXES = {".xlsx", ".xlsm", ".xls"}
-TEXT_SUFFIXES = {".csv", ".txt", ".tsv", ".dat", ".tpl"}
+TEXT_SUFFIXES = {".csv", ".txt", ".tsv", ".dat"}
 
 
 @dataclass
@@ -157,70 +157,7 @@ def read_excel_raw(data: bytes, filename: str, sheet_name: str) -> pd.DataFrame:
     )
 
 
-def parse_trend_file(data: bytes) -> tuple[pd.DataFrame, str]:
-    """Parses an OLGA .tpl trend file."""
-    text = decode_text(data)
-    lines = text.splitlines()
-    
-    catalog_pos = -1
-    for i, line in enumerate(lines):
-        if line.strip().upper() == 'CATALOG':
-            catalog_pos = i
-            break
-            
-    if catalog_pos == -1:
-        raise ValueError("Could not find 'CATALOG' section in the .tpl file.")
-
-    try:
-        # Extract headers from the CATALOG section
-        num_catalog_entries = int(lines[catalog_pos + 1].strip())
-        catalog_end_line = catalog_pos + 2 + num_catalog_entries
-        
-        headers = ["Time"]
-        for i in range(catalog_pos + 2, catalog_end_line):
-            line_text = lines[i]
-            # Attempt to find a canonical channel name like PT201 in the line
-            channel = canonical_channel(line_text)
-            if channel:
-                headers.append(channel)
-            else:
-                # Fallback for non-standard headers like VOLGBL, HT
-                parts = line_text.split("'")
-                if parts and parts[0].strip():
-                    headers.append(parts[0].strip())
-
-        # Find the start of the actual data, which is marked by "TIME SERIES"
-        data_start_line = -1
-        for i in range(catalog_end_line, len(lines)):
-            if "TIME SERIES" in lines[i].upper():
-                data_start_line = i + 1
-                break
-        
-        if data_start_line == -1:
-            raise ValueError("Could not find 'TIME SERIES' marker after 'CATALOG' section.")
-
-        data_rows = [line.split() for line in lines[data_start_line:] if line.strip()]
-
-        if not data_rows:
-            df = pd.DataFrame(columns=headers)
-        else:
-            # Ensure the number of headers matches the widest data row to prevent errors
-            max_cols = max(len(row) for row in data_rows)
-            df = pd.DataFrame(data_rows, dtype=object, columns=headers[:max_cols] if headers else None)
-
-    except (ValueError, IndexError) as e:
-        raise ValueError(f"Failed to parse OLGA .tpl file structure after finding CATALOG. Error: {e}") from e
-    
-    return df, "Trend (.tpl)"
-
-
 def find_header_row(raw: pd.DataFrame) -> int:
-    # For .tpl files, the header is now the first row (index 0) of the parsed frame.
-    # For other files, we search for it.
-    if "Time" in raw.columns and any(CHANNEL_RE.search(str(c)) for c in raw.columns):
-        return -1 # Indicates headers are already set in the columns
-
-    # Fallback for non-tpl files
     best_row = -1
     best_score = 0
     for row_index in range(min(len(raw), 200)):
@@ -266,14 +203,7 @@ def parse_raw_table(
 
     raw = raw.dropna(axis=1, how="all").dropna(axis=0, how="all").reset_index(drop=True)
     header_row = find_header_row(raw)
-
-    if header_row == -1: # Headers are in columns
-        headers = raw.columns.tolist()
-        data_start_row = 0
-    else: # Headers are in a row
-        headers = raw.iloc[header_row].tolist()
-        data_start_row = header_row + 1
-
+    headers = raw.iloc[header_row].tolist()
     series: dict[str, pd.DataFrame] = {}
     units: dict[str, str] = {}
     warnings: list[str] = []
@@ -288,8 +218,8 @@ def parse_raw_table(
             warnings.append(f"{channel}: no associated time column was found.")
             continue
 
-        time = numeric_series(raw.iloc[data_start_row:, time_col])
-        value = numeric_series(raw.iloc[data_start_row:, value_col])
+        time = numeric_series(raw.iloc[header_row + 1 :, time_col])
+        value = numeric_series(raw.iloc[header_row + 1 :, value_col])
         frame = pd.DataFrame({"time_s": time, "value": value}).dropna()
         if frame.empty:
             warnings.append(f"{channel}: no numeric time/value pairs were found.")
@@ -334,13 +264,6 @@ def get_parsed_dataset(
             sheet_name = excel_sheet_names(file_data, filename)[0]
         raw = read_excel_raw(file_data, filename, sheet_name)
         return parse_raw_table(raw, dataset_name, sheet_name), f"Excel sheet: {sheet_name}"
-    if suffix == ".tpl":
-        raw, _ = parse_trend_file(file_data)
-        # The .tpl parser returns a clean dataframe with headers in the columns.
-        # We can pass this directly to parse_raw_table, which will detect the
-        # headers in the columns and skip the row-based search.
-        return parse_raw_table(raw, dataset_name), "OLGA Trend File"
-
     if suffix in TEXT_SUFFIXES or not suffix:
         try:
             raw, delimiter = read_text_raw(file_data)
@@ -638,73 +561,13 @@ def main() -> None:
     with upload_left:
         st.subheader("Real / measured data")
         real_upload = st.file_uploader(
-            "Upload measured file", type=["csv", "tsv", "txt", "dat", "xlsx", "xlsm", "xls", "tpl"], key="real"
+            "Upload measured file", type=["csv", "tsv", "txt", "dat", "xlsx", "xlsm", "xls"], key="real"
         )
     with upload_right:
         st.subheader("Simulated data")
         simulated_upload = st.file_uploader(
-            "Upload simulation file", type=["csv", "tsv", "txt", "dat", "xlsx", "xlsm", "xls", "tpl"], key="simulated"
+            "Upload simulation file", type=["csv", "tsv", "txt", "dat", "xlsx", "xlsm", "xls"], key="simulated"
         )
-
-    # --- SIDEBAR (GLOBAL CONTROLS) ---
-    # The sidebar must be defined outside the tabs to prevent re-rendering issues.
-    # We use session_state to check if we can show the controls yet.
-    if st.session_state.get("channels_submitted"):
-        with st.sidebar:
-            st.header("Alignment")
-            normalize_start = st.toggle(
-                "Set each channel's first time to 0", value=False,
-                help="Applied before the manual time shifts below.",
-            )
-            real_time_shift = st.number_input("Measured time shift [s]", value=0.0, format="%.9f", key="real_time_shift")
-            simulated_time_shift = st.number_input("Simulation time shift [s]", value=0.0, format="%.9f", key="simulated_time_shift")
-            grid_mode = st.selectbox(
-                "Comparison grid", ["Real timestamps", "Simulated timestamps", "Uniform overlap grid"], key="grid_mode"
-            )
-            uniform_points = st.number_input(
-                "Uniform grid points", min_value=100, max_value=500_000, value=5000, step=100,
-                disabled=grid_mode != "Uniform overlap grid", key="uniform_points"
-            )
-
-            st.header("Value transform")
-            st.caption("Transformed value = original × scale + offset")
-            real_scale = st.number_input("Measured scale", value=1.0, format="%.9f", key="real_scale")
-            real_offset = st.number_input("Measured offset", value=0.0, format="%.9f", key="real_offset")
-            simulated_scale = st.number_input("Simulation scale", value=0.00001, format="%.9f", key="simulated_scale")
-            simulated_offset = st.number_input("Simulation offset", value=0.0, format="%.9f", key="simulated_offset")
-
-            # Auto-scaling for Pa vs bar mismatch
-            if st.session_state.get("real_data") and st.session_state.get("simulated_data"):
-                real_units = st.session_state.real_data.units
-                sim_units = st.session_state.simulated_data.units
-                # Check if any selected channel has the mismatch
-                auto_scale = any(
-                    real_units.get(ch, "").lower() in ("bar", "bara", "barg") and sim_units.get(ch, "").lower() == "pa"
-                    for ch in st.session_state.selected_channels
-                )
-                # Only apply auto-scale if the widget is still at its default value of 1.0
-                is_default_scale = st.session_state.get("simulated_scale", 1.0) == 1.0
-                if auto_scale and is_default_scale:
-                    st.session_state.simulated_scale = 1e-5
-                    # Re-run to update the widget display with the new value
-                    st.rerun() 
-
-            # The transformed_range call needs to happen here to get default window values
-            if st.session_state.get("real_data") and st.session_state.get("simulated_data"):
-                real_range = transformed_range(st.session_state.real_data, st.session_state.selected_channels, normalize_start, real_time_shift)
-                sim_range = transformed_range(
-                    st.session_state.simulated_data, st.session_state.selected_channels, normalize_start, simulated_time_shift
-                )
-                default_start = max(real_range[0], sim_range[0])
-                default_end = min(real_range[1], sim_range[1])
-                st.header("Time window")
-                use_window = st.toggle("Limit comparison window", value=False, key="use_window")
-                window_start = st.number_input(
-                    "Window start [s]", value=float(default_start), format="%.9f", disabled=not use_window, key="window_start"
-                )
-                window_end = st.number_input(
-                    "Window end [s]", value=float(default_end), format="%.9f", disabled=not use_window, key="window_end"
-                )
 
     main_tabs = st.tabs(["Data Comparison", "CFL Calculator"])
 
@@ -719,36 +582,27 @@ def main() -> None:
                 )
             return
 
-        try:
-            real_bytes = real_upload.getvalue()
-            simulated_bytes = simulated_upload.getvalue()
-        except Exception as e:
-            st.error(f"Error reading files from path: {e}")
-            return
+        real_bytes = real_upload.getvalue()
+        simulated_bytes = simulated_upload.getvalue()
 
         real_sheet = None
         simulated_sheet = None
-        simulated_filepath = Path(simulated_upload.name)
         try:
             if Path(real_upload.name).suffix.lower() in EXCEL_SUFFIXES:
                 real_sheets = excel_sheet_names(real_bytes, real_upload.name)
                 real_sheet = st.selectbox("Measured Excel sheet", real_sheets, key="real_sheet")
-            if simulated_filepath.suffix.lower() in EXCEL_SUFFIXES:
-                simulated_sheets = excel_sheet_names(simulated_bytes, simulated_filepath.name)
+            if Path(simulated_upload.name).suffix.lower() in EXCEL_SUFFIXES:
+                simulated_sheets = excel_sheet_names(simulated_bytes, simulated_upload.name)
                 simulated_sheet = st.selectbox("Simulation Excel sheet", simulated_sheets, key="sim_sheet")
         except Exception as exc:
             st.error(f"The Excel workbook could not be opened: {exc}")
             return
 
         try:
-            # Use file path as part of the cache key to handle different files
             real_data, real_note = get_parsed_dataset(
                 real_upload.file_id, real_bytes, real_upload.name, "Real", real_sheet)
             simulated_data, simulated_note = get_parsed_dataset(
-                str(simulated_filepath), simulated_bytes, simulated_filepath.name, "Simulated", simulated_sheet)
-            # Store data in session state for the sidebar to access
-            st.session_state.real_data = real_data
-            st.session_state.simulated_data = simulated_data
+                simulated_upload.file_id, simulated_bytes, simulated_upload.name, "Simulated", simulated_sheet)
         except (ValueError, IndexError, KeyError) as exc:
             st.error(f"Parsing failed: {exc}")
             st.exception(exc)
@@ -834,10 +688,43 @@ def main() -> None:
                 "No automatic unit conversion is applied; use the scale/offset controls when needed."
             )
 
-        # Retrieve values from sidebar widgets (which are now in session_state)
-        use_window = st.session_state.get("use_window", False)
-        window_start = st.session_state.get("window_start", 0.0)
-        window_end = st.session_state.get("window_end", 0.0)
+        with st.sidebar:
+            st.header("Alignment")
+            normalize_start = st.toggle(
+                "Set each channel's first time to 0", value=False,
+                help="Applied before the manual time shifts below.",
+            )
+            real_time_shift = st.number_input("Measured time shift [s]", value=0.0, format="%.9f")
+            simulated_time_shift = st.number_input("Simulation time shift [s]", value=0.0, format="%.9f")
+            grid_mode = st.selectbox(
+                "Comparison grid", ["Real timestamps", "Simulated timestamps", "Uniform overlap grid"]
+            )
+            uniform_points = st.number_input(
+                "Uniform grid points", min_value=100, max_value=500_000, value=5000, step=100,
+                disabled=grid_mode != "Uniform overlap grid",
+            )
+
+            st.header("Value transform")
+            st.caption("Transformed value = original × scale + offset")
+            real_scale = st.number_input("Measured scale", value=1.0, format="%.9f")
+            real_offset = st.number_input("Measured offset", value=0.0, format="%.9f")
+            simulated_scale = st.number_input("Simulation scale", value=1.0, format="%.9f")
+            simulated_offset = st.number_input("Simulation offset", value=0.0, format="%.9f")
+
+            real_range = transformed_range(real_data, st.session_state.selected_channels, normalize_start, real_time_shift)
+            sim_range = transformed_range(
+                simulated_data, st.session_state.selected_channels, normalize_start, simulated_time_shift
+            )
+            default_start = max(real_range[0], sim_range[0])
+            default_end = min(real_range[1], sim_range[1])
+            st.header("Time window")
+            use_window = st.toggle("Limit comparison window", value=False)
+            window_start = st.number_input(
+                "Window start [s]", value=float(default_start), format="%.9f", disabled=not use_window
+            )
+            window_end = st.number_input(
+                "Window end [s]", value=float(default_end), format="%.9f", disabled=not use_window
+            )
 
         if use_window and window_end <= window_start:
             st.error("Window end must be greater than window start.")
@@ -847,15 +734,15 @@ def main() -> None:
             _real_data_name=real_data.name, real_data=real_data,
             simulated_data=simulated_data,
             channels=st.session_state.selected_channels,
-            grid_mode=st.session_state.get("grid_mode", "Real timestamps"),
-            uniform_points=int(st.session_state.get("uniform_points", 5000)),
-            normalize_start=st.session_state.get("normalize_start", False),
-            real_time_shift=st.session_state.get("real_time_shift", 0.0),
-            simulated_time_shift=st.session_state.get("simulated_time_shift", 0.0),
-            real_scale=st.session_state.get("real_scale", 1.0),
-            real_offset=st.session_state.get("real_offset", 0.0),
-            simulated_scale=st.session_state.get("simulated_scale", 1.0),
-            simulated_offset=st.session_state.get("simulated_offset", 0.0),
+            grid_mode=grid_mode,
+            uniform_points=int(uniform_points),
+            normalize_start=normalize_start,
+            real_time_shift=real_time_shift,
+            simulated_time_shift=simulated_time_shift,
+            real_scale=real_scale,
+            real_offset=real_offset,
+            simulated_scale=simulated_scale,
+            simulated_offset=simulated_offset,
         )
 
         aligned_final = process_aligned_data(
