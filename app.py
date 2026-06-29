@@ -641,11 +641,9 @@ def main() -> None:
             "Upload measured file", type=["csv", "tsv", "txt", "dat", "xlsx", "xlsm", "xls", "tpl"], key="real"
         )
     with upload_right:
-        st.subheader("Simulated data path")
-        simulated_path = st.text_input(
-            "Enter path to simulation file",
-            key="simulated_path",
-            placeholder="C:\\path\\to\\your\\simulated_data.tpl"
+        st.subheader("Simulated data")
+        simulated_upload = st.file_uploader(
+            "Upload simulation file", type=["csv", "tsv", "txt", "dat", "xlsx", "xlsm", "xls", "tpl"], key="simulated"
         )
 
     # --- SIDEBAR (GLOBAL CONTROLS) ---
@@ -711,7 +709,7 @@ def main() -> None:
     main_tabs = st.tabs(["Data Comparison", "CFL Calculator"])
 
     with main_tabs[0]:
-        if real_upload is None or not simulated_path:
+        if real_upload is None or simulated_upload is None:
             st.info("Upload both files to start the comparison.")
             with st.expander("Expected formats"):
                 st.markdown(
@@ -723,14 +721,14 @@ def main() -> None:
 
         try:
             real_bytes = real_upload.getvalue()
-            simulated_filepath = Path(simulated_path)
-            simulated_bytes = simulated_filepath.read_bytes()
+            simulated_bytes = simulated_upload.getvalue()
         except Exception as e:
             st.error(f"Error reading files from path: {e}")
             return
 
         real_sheet = None
         simulated_sheet = None
+        simulated_filepath = Path(simulated_upload.name)
         try:
             if Path(real_upload.name).suffix.lower() in EXCEL_SUFFIXES:
                 real_sheets = excel_sheet_names(real_bytes, real_upload.name)
