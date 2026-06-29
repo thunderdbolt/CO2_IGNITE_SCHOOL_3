@@ -157,7 +157,70 @@ def read_excel_raw(data: bytes, filename: str, sheet_name: str) -> pd.DataFrame:
     )
 
 
+def parse_trend_file(data: bytes) -> tuple[pd.DataFrame, str]:
+    """Parses an OLGA .tpl trend file."""
+    text = decode_text(data)
+    lines = text.splitlines()
+    
+    catalog_pos = -1
+    for i, line in enumerate(lines):
+        if line.strip().upper() == 'CATALOG':
+            catalog_pos = i
+            break
+            
+    if catalog_pos == -1:
+        raise ValueError("Could not find 'CATALOG' section in the .tpl file.")
+
+    try:
+        # Extract headers from the CATALOG section
+        num_catalog_entries = int(lines[catalog_pos + 1].strip())
+        catalog_end_line = catalog_pos + 2 + num_catalog_entries
+        
+        headers = ["Time"]
+        for i in range(catalog_pos + 2, catalog_end_line):
+            line_text = lines[i]
+            # Attempt to find a canonical channel name like PT201 in the line
+            channel = canonical_channel(line_text)
+            if channel:
+                headers.append(channel)
+            else:
+                # Fallback for non-standard headers like VOLGBL, HT
+                parts = line_text.split("'")
+                if parts and parts[0].strip():
+                    headers.append(parts[0].strip())
+
+        # Find the start of the actual data, which is marked by "TIME SERIES"
+        data_start_line = -1
+        for i in range(catalog_end_line, len(lines)):
+            if "TIME SERIES" in lines[i].upper():
+                data_start_line = i + 1
+                break
+        
+        if data_start_line == -1:
+            raise ValueError("Could not find 'TIME SERIES' marker after 'CATALOG' section.")
+
+        data_rows = [line.split() for line in lines[data_start_line:] if line.strip()]
+
+        if not data_rows:
+            df = pd.DataFrame(columns=headers)
+        else:
+            # Ensure the number of headers matches the widest data row to prevent errors
+            max_cols = max(len(row) for row in data_rows)
+            df = pd.DataFrame(data_rows, dtype=object, columns=headers[:max_cols] if headers else None)
+
+    except (ValueError, IndexError) as e:
+        raise ValueError(f"Failed to parse OLGA .tpl file structure after finding CATALOG. Error: {e}") from e
+    
+    return df, "Trend (.tpl)"
+
+
 def find_header_row(raw: pd.DataFrame) -> int:
+    # For .tpl files, the header is now the first row (index 0) of the parsed frame.
+    # For other files, we search for it.
+    if "Time" in raw.columns and any(CHANNEL_RE.search(str(c)) for c in raw.columns):
+        return -1 # Indicates headers are already set in the columns
+
+    # Fallback for non-tpl files
     best_row = -1
     best_score = 0
     for row_index in range(min(len(raw), 200)):
@@ -203,7 +266,14 @@ def parse_raw_table(
 
     raw = raw.dropna(axis=1, how="all").dropna(axis=0, how="all").reset_index(drop=True)
     header_row = find_header_row(raw)
-    headers = raw.iloc[header_row].tolist()
+
+    if header_row == -1: # Headers are in columns
+        headers = raw.columns.tolist()
+        data_start_row = 0
+    else: # Headers are in a row
+        headers = raw.iloc[header_row].tolist()
+        data_start_row = header_row + 1
+
     series: dict[str, pd.DataFrame] = {}
     units: dict[str, str] = {}
     warnings: list[str] = []
@@ -218,8 +288,8 @@ def parse_raw_table(
             warnings.append(f"{channel}: no associated time column was found.")
             continue
 
-        time = numeric_series(raw.iloc[header_row + 1 :, time_col])
-        value = numeric_series(raw.iloc[header_row + 1 :, value_col])
+        time = numeric_series(raw.iloc[data_start_row:, time_col])
+        value = numeric_series(raw.iloc[data_start_row:, value_col])
         frame = pd.DataFrame({"time_s": time, "value": value}).dropna()
         if frame.empty:
             warnings.append(f"{channel}: no numeric time/value pairs were found.")
@@ -264,6 +334,13 @@ def get_parsed_dataset(
             sheet_name = excel_sheet_names(file_data, filename)[0]
         raw = read_excel_raw(file_data, filename, sheet_name)
         return parse_raw_table(raw, dataset_name, sheet_name), f"Excel sheet: {sheet_name}"
+    if suffix == ".tpl":
+        raw, _ = parse_trend_file(file_data)
+        # The .tpl parser returns a clean dataframe with headers in the columns.
+        # We can pass this directly to parse_raw_table, which will detect the
+        # headers in the columns and skip the row-based search.
+        return parse_raw_table(raw, dataset_name), "OLGA Trend File"
+
     if suffix in TEXT_SUFFIXES or not suffix:
         try:
             raw, delimiter = read_text_raw(file_data)
@@ -595,8 +672,24 @@ def main() -> None:
             st.caption("Transformed value = original × scale + offset")
             real_scale = st.number_input("Measured scale", value=1.0, format="%.9f", key="real_scale")
             real_offset = st.number_input("Measured offset", value=0.0, format="%.9f", key="real_offset")
-            simulated_scale = st.number_input("Simulation scale", value=1.0, format="%.9f", key="simulated_scale")
+            simulated_scale = st.number_input("Simulation scale", value=0.00001, format="%.9f", key="simulated_scale")
             simulated_offset = st.number_input("Simulation offset", value=0.0, format="%.9f", key="simulated_offset")
+
+            # Auto-scaling for Pa vs bar mismatch
+            if st.session_state.get("real_data") and st.session_state.get("simulated_data"):
+                real_units = st.session_state.real_data.units
+                sim_units = st.session_state.simulated_data.units
+                # Check if any selected channel has the mismatch
+                auto_scale = any(
+                    real_units.get(ch, "").lower() in ("bar", "bara", "barg") and sim_units.get(ch, "").lower() == "pa"
+                    for ch in st.session_state.selected_channels
+                )
+                # Only apply auto-scale if the widget is still at its default value of 1.0
+                is_default_scale = st.session_state.get("simulated_scale", 1.0) == 1.0
+                if auto_scale and is_default_scale:
+                    st.session_state.simulated_scale = 1e-5
+                    # Re-run to update the widget display with the new value
+                    st.rerun() 
 
             # The transformed_range call needs to happen here to get default window values
             if st.session_state.get("real_data") and st.session_state.get("simulated_data"):
